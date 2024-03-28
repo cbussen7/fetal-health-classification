@@ -1,0 +1,426 @@
+---
+title: "Midterm Project"
+author: "Christopher Bussen"
+date: "2024-03-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# load libraries
+library(pacman)
+pacman::p_load(tidyverse, DT, randomForest, corrplot, nnet, car, MASS, tree, class, e1071,
+               gridExtra, rlang)
+```
+
+```{r}
+# load dataset
+ctg <- read_csv("/Users/christopherbussen/Documents/School/UDS2024/MTH415/midterm/CTG.csv")
+
+# clean dataset
+# get rid of first column (file name)
+ctg <- ctg[, -1]
+
+# according to original study, class only needed if you want to use for 10-class experiments
+# DR not useful - all 0s
+ctg <- subset(ctg, select = -c(DR, CLASS))
+ctg$NSP <- as.factor(ctg$NSP)
+```
+**DATA CLEANING NOTE**: when first looking into this dataset, I looked at the website for the original study and it mentioned that the class variable is only needed if you want to conduct experiments for 10-class classification problems. As a result, I removed this variable from the dataset. I also dropped the first column of the dataset as it was simply the file name which will not help with classification as well as the variable DR as it was all 0s throughout the data.
+
+
+## Introduction
+
+In this report, I analyze a dataset related to fetal health based on many different predictors recorded from fetal cardiotocograms (CTGs). The goal of this report is to create a model that is able to give automated predictions of fetal health (variable NSP). The NSP variable has three classes: 1 (normal), 2 (suspect), and 3 (pathologic). As I have no prior experience with this kind of data or scenario, I do not have much of an idea of what variables should be important and what variables should not. Additionally, while I'm not sure how accurate predictions based on CTGs typically can be, I am hoping for a model that can achieve at least 90% accuracy.
+
+
+## EDA
+
+Below, I will perform some brief exploratory data analysis to get a better sense for the data and each variable, as well as the potential relationships between variables.
+
+
+### Data Table
+
+Below we can see the general structure of the dataset as a whole as well as the summary statistics tables for each variable. I also included the entire table of the dataset for full transparency. This helps us to understand the dataset more before creating models to try to predict NSP.
+
+```{r data structure}
+# show structure and summary stats of dataset
+str(ctg)
+# summary stats
+summary(ctg)
+# show table
+DT::datatable(ctg)
+```
+
+As we can see above, this dataset contains 2126 observations, each with 22 unique numerical predictor variables and the response variable (NSP), having values of 1, 2, or 3.
+
+```{r class distribution}
+# look at distribution of classes
+(nsp_tab <- table(ctg$NSP))
+
+# class n summary
+n.class <- filter(ctg, NSP == 1)
+summary(n.class)
+
+# class s summary
+s.class <- filter(ctg, NSP == 2)
+summary(s.class)
+
+# class p summary
+p.class <- filter(ctg, NSP == 3)
+summary(p.class)
+```
+
+From the table of NSP class values, we see there are clearly more (1655) observations of class Normal (NSP=1) than both Suspect (NSP=2) or Pathologic (NSP=3), which we would expect. Next, there are 295 observations of class S and only 176 of class P. I also included the summary statistics for each variable among observations for each value of NSP.
+
+```{r histograms}
+plots <- list()
+feature_names <- names(ctg[, sapply(ctg, is.numeric)])
+
+for (i in seq_along(feature_names)) {
+    feature <- feature_names[i]
+    plots[[i]] <- ggplot(ctg, aes(!!sym(feature))) + 
+                  geom_histogram(bins = 20, fill = "lightblue") +
+                  theme(axis.title.y = element_blank(), axis.text = element_blank())
+}
+
+do.call("grid.arrange", c(plots, ncol = 5))
+```
+
+Above I decided to plot histograms of each of the 21 features to visualize their overall distribution in order to give more context to the summary statistics provided above. From these histograms, it is easier to see their general shape, spread, and measure of center in addition to any potential unusual features. For example, we can see that several of the variables appear to be roughly symmetric (LB, Max, Mean, Median) whereas several others are rather skewed or only have a few different values.
+
+```{r corrplot}
+# look at how certain features are related to each other
+# correlation plot between variables
+cor_mat <- cor(ctg[sapply(ctg, is.numeric)])
+corrplot(cor_mat, method = "pie")
+```
+
+This correlation plot shows as the strength and direction of the relationships between each of the 21 predictors in this dataset. As we can see here, some of the variables that tend to be more correlated with each other are "LB", "MSTV", "Min", "Nmax", "Mean", "Median", "Mode", "Width", and "Variance". Below I will plot these variables against each other while using different colors to show classes.
+
+```{r top correlations}
+# create scatterplots of some of the more correlated variables
+top_corr <- c("LB","MSTV","Min","Nmax","Mean","Median","Mode","Width", "Variance")
+colors <- c("brown1", "darkgreen", "cyan")
+pairs(ctg[, top_corr], pch = 1, lower.panel = NULL, cex = 0.1, col = colors[ctg$NSP])
+```
+
+Above I have plotted some of the variables with the highest correlations between each other while also displaying the different observations using different colors to represent their classes. This allows us to see which variables might have a more obvious relationship with a clear impact on NSP class. Please note that the orange color represents NSP=1 (N), the dark green color represents NSP=2 (S), and the cyan color represents NSP=3 (P). Here we can see that predictors such as mean, median, and mode are all strongly correlated with each other and seem to have an impact on the class of NSP.
+
+
+## Models
+
+In this section, I will create several models that attempt to accurately predict the values of NSP for each of the observations in the testing data. Because NSP has three classes, I must ensure that each model allows for more than just binary classification. For example, I cannot use logistic regression but instead would have to use multinomial regression. The algorithms I plan to use include multinomial regression, decision trees, random forests, K-Nearest Neighbors (KNN), and Support Vector Machine (SVM). Throughout model creation, (when applicable) I used cross-validation to tune my parameters and/or used for loops to test a set of values for a given tuning parameter and picked the value that minimized error. Lastly, in an attempts to avoid overfitting, I used cross-validation to ensure that there were no major variations and I made sure that my models worked well for both training and testing data instead of dropping off for the test data. As you'll see further below, I also used examples of much more simple models through dimensionality reduction using PCA.
+
+```{r partition data}
+# create train and test data
+set.seed(22)
+trainIndex <- sample(c(1:nrow(ctg)), 1750)
+
+train <- ctg[trainIndex, ]
+test <- ctg[-trainIndex, ]
+```
+
+### Multinomial Regression Models
+
+Below I will create a multinomial regression model using the full set of predictors as well as a model with a reduced set of predictors found through backwards elimination.
+
+```{r multinomial}
+fit.multi = multinom(NSP ~ ., data = train)
+summary(fit.multi)
+
+preds <- predict(fit.multi, newdata = test)
+# print confusion matrix
+(confusion_matrix <- table(Predicted = preds, Actual = test$NSP))
+# Calculate accuracy
+(accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix))
+
+# code to find p-values below: insignificant predictors to be removed below
+# Get coefficients and standard errors
+# coefs <- coefficients(fit.multi)
+# std_errors <- summary(fit.multi)$standard.errors
+
+# Calculate z-values
+# z_values <- coefs / std_errors
+
+# Calculate p-values
+# (p_values <- 2 * (1 - pnorm(abs(z_values))))
+
+```
+
+Here we see that the full multinomial regression model performs well with an accuracy of 88%. While this is solid for our first model, it can likely be improved upon by reducing the high dimensionality.
+
+```{r backwards selection, results='hide'}
+# perform feature selection using backward elimination - backward less prone to overfitting
+# put in own code block and set message=FALSE because output was very long
+backward.elim <- stepAIC(fit.multi, direction = "backward", trace = FALSE)
+```
+
+
+```{r backwards elim multi}
+summary(backward.elim)
+# create new reduced model w call from backward elim
+fit.multi.reduced <- multinom(formula = NSP ~ LB + AC + FM + UC + ASTV + MSTV + ALTV + 
+    DP + Width + Min + Nmax + Mode + Mean + Variance, data = train)
+summary(fit.multi.reduced)
+
+preds <- predict(fit.multi.reduced, newdata = test)
+
+# print confusion matrix
+(confusion_matrix <- table(Predicted = preds, Actual = test$NSP))
+# Calculate accuracy
+(accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix))
+```
+
+
+After the results from the original multinomial regression model, I decided to use backwards elimination to reduce the dimensionality, which got rid of 7 predictors in the model (decided to do backwards because it is less prone to overfitting in models with large numbers of predictors). I then recreated the model and it slightly boosted the accuracy to just below 89%.
+
+
+### Decision Tree Models
+
+Below I will create a decision tree to predict the NSP variable as well as a larger tree that I will then prune and use for predictions.
+
+```{r decision tree}
+set.seed(22)
+
+# create tree model
+fit.tree <- tree(NSP ~ ., data = train)
+
+summary(fit.tree)
+
+plot(fit.tree)
+text(fit.tree, pretty = 1)
+
+preds <- predict(fit.tree, newdata = test, type = "class")
+
+# print confusion matrix
+(confusion_matrix <- table(Predicted = preds, Actual = test$NSP))
+# Calculate accuracy/error rate
+(accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix))
+(err_rate <- mean(preds != test$NSP))
+```
+
+Here we can see a pretty good accuracy of about 92% from a decision tree with 15 terminal nodes. Below, I will investigate what happens if we grow this tree deeper and then prune it for predictions.
+
+```{r pruned tree}
+set.seed(22)
+# use tree.control() to make a larger tree
+tree_ctrl <- tree.control(nobs = nrow(train), mincut = 1, minsize = 50, mindev = 0)
+
+# create tree using controls defined above
+tree.larger <- tree(NSP ~ ., data = train, control = tree_ctrl)
+summary(tree.larger)
+
+# prune tree using cross validation to find optimal size
+(cv.larger = cv.tree(tree.larger, FUN = prune.misclass, K = 5))
+
+k_vals <- c(seq(from = 4, to = 30, by = 2))
+err_rates <- c()
+
+for (i in seq_along(k_vals))
+{
+   k <- k_vals[i]
+   prune.larger <- prune.misclass(tree.larger, best = k)
+   preds <- predict(prune.larger, test, type = "class")
+   err_rates[i] <- mean(preds != test$NSP)
+}
+
+# find best value of k
+k_and_err <- data.frame(k = k_vals, Err = err_rates)
+k_row <- which.min(k_and_err$Err)
+(optimal_k <- k_and_err$k[k_row])
+
+tree.pruned <- prune.misclass(tree.larger, best = 22)
+plot(tree.pruned)
+text(tree.pruned, pretty = 1)
+
+preds_pruned <- predict(tree.pruned, test, type = "class")
+
+confusion_matrix_pruned <- table(Predicted = preds_pruned, Actual = test$NSP)
+(accuracy_pruned <- sum(diag(confusion_matrix_pruned)) / sum(confusion_matrix_pruned))
+(err_rate <- mean(preds_pruned != test$NSP))
+```
+
+When we make the tree deeper, we can see it starts with almost double the amount of terminal nodes as the original tree. After testing many values of k for the tree, we see that the best value (one that minimizes error) is 22. After creating a new decision tree using this parameter, we get a slightly improved accuracy rate of 92.8% compared to the original decision tree with 92%.
+
+### Random Forest Model
+
+```{r randomForest}
+set.seed(22)
+# create empty vector for oob errors
+out_of_bag_errors <- c()
+
+# loop through all values for mtry
+for (mtry_values in 1:15) 
+   {
+   # create each model and acces its error rate by looking at the oob row
+    rf <- randomForest(NSP ~ ., data = train, mtry = mtry_values, 
+                          importance = TRUE)
+    out_of_bag_errors[mtry_values] <- rf$err.rate[nrow(rf$err.rate), "OOB"]
+}
+
+# find min oob error and use as mtry value in rf model
+out_of_bag_errors
+(best <- which.min(out_of_bag_errors))
+rf <- randomForest(NSP ~ ., data = train, mtry = best, importance = TRUE)
+
+# predict values and find error rate
+preds <- predict(rf, test)
+(confusion_rf <- table(Predicted = preds, Actual = test$NSP))
+(accuracy_rf <- sum(diag(confusion_rf)) / sum(confusion_rf))
+(err_rate <- mean(preds != test$NSP))
+```
+
+Here we can see from the for loop that the best value for mtry is 7 as it yields the lowest error rate of 0.04521277. This model performs better than the single decision tree, which we would expect (due to the idea of bagging), and is the best model we have seen yet with an accuracy over 95%. 
+
+
+### KNN Model
+
+```{r KNN}
+set.seed(22)
+# normalize data since it relies on distance - need same units
+normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+
+train_pred <- normalize(train[1:21])
+train_response <- train$NSP
+test_pred <- normalize(test[1:21])
+test_response <- test$NSP
+
+# get predictions using knn method
+accuracies <- c()
+for (i in 1:10) {
+   knn_pred <- knn(train_pred, test_pred, cl = train_response, k = i)
+   # create table for confusion matrix
+   confusion <- table(Pred = knn_pred, Actual = test_response)
+   
+   # print fraction of correct predictions
+   accuracies[i] <- sum(diag(confusion)) / sum(confusion)
+}
+
+accuracies
+(best_k <- (which.max(accuracies)))
+accuracies[best_k]
+```
+
+Above we can see that KNN using the full set of predictors is easily the worst performing model we have seen so far, with an accuracy of under 80%. This does not surprise me as KNN is heavily affected by high dimensionality and we have 21 predictors.
+
+
+### SVM Model
+
+```{r svm}
+set.seed(22)
+# create svm with different costs - also testing different kernels and leaving best
+tune.out = tune(svm, NSP ~ ., data = train, kernel = "radial", 
+                ranges = list(cost = c(.1,1,5,10,25,35,50,75,100)))
+summary(tune.out)
+
+fit.svm = svm(NSP ~ ., data = train, kernel = "radial", cost = 50, scale = TRUE)
+summary(fit.svm)
+
+preds <- predict(fit.svm, newdata = test)
+# print confusion matrix
+(confusion_matrix <- table(Predicted = preds, Actual = test$NSP))
+# Calculate accuracy
+(accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix))
+```
+
+In the code above, I tested SVMs with several different cost values to find which would give the lowest error and found that a cost around 50 worked the best. Additionally, I checked all of the different SVM kernels (linear, polynomial, radial, and sigmoid) and radial worked the best followed by polynomial. After creating a new SVM model based on these findings, the model had about 93.4% accuracy, which is solid compared to the rest of the models.
+
+### PCA Models
+
+In this section, I will perform Principal Component Analysis (PCA) on the data to reduce the dimensionality of the data we are using. This is because many times, the curse of high dimensionality can hinder certain models/algorithms from performing at their best due to considering noise or highly correlated variables that will throw off the model's predictions. Overall, I will recreate the multinomial regression model, KNN model, and SVM model using the PCA data and compare their performance to the original models. I am expecting PCA to have the biggest impact on KNN because high dimensionality can drastically hurt KNN's predictions. Additionally, I am not performing PCA for the decision tree and random forest models because trees already somewhat perform their own dimension reduction by choosing what splits are most important among all features. 
+
+```{r pca}
+pca_data <- prcomp(ctg[1:21], center = TRUE, scale. = TRUE)
+summary(pca_data)
+
+pca_components <- pca_data$x[, 1:10]
+pca_components <- data.frame(pca_components)
+```
+
+From the PCA summary above, I will use the first 10 components of PCA because it captures over 85% of the variance, which I have found to be a good threshold based on brief research. Below I will recreate the multinomial regression and KNN models using the PCA data.
+
+
+### Multinomial Regression Model using PCA
+
+```{r pca multinomial}
+set.seed(22)
+trainIndex.pca <- sample(c(1:nrow(pca_components)), 1750)
+
+train.pca <- pca_components[trainIndex.pca, ]
+train.pca$NSP <- train$NSP
+test.pca <- pca_components[-trainIndex.pca, ]
+test.pca$NSP <- test$NSP
+
+# multinomial
+fit.multi.pca = multinom(NSP ~ ., data = train.pca)
+summary(fit.multi.pca)
+
+preds <- predict(fit.multi.pca, newdata = test.pca)
+# print confusion matrix
+(confusion_matrix <- table(Predicted = preds, Actual = test.pca$NSP))
+# Calculate accuracy
+(accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix))
+```
+
+Note here that the accuracy for the multinomial regression model using PCA for dimension reduction is slightly better than the original model as well as the model that eliminated some features using backwards elimination. This is likely due to PCA combining some of the highly correlated features into individual components.
+
+
+### KNN Model using PCA
+
+```{r pca knn}
+set.seed(22)
+
+train.pca_pred <- normalize(train.pca[1:10])
+train.pca_response <- train.pca$NSP
+test.pca_pred <- normalize(test.pca[1:10])
+test.pca_response <- test.pca$NSP
+
+# get predictions using knn method
+accuracies <- c()
+for (i in 1:10) {
+   knn.pca_pred <- knn(train.pca_pred, test.pca_pred, cl = train.pca_response, k = i)
+   # create table for confusion matrix
+   confusion <- table(Pred = knn.pca_pred, Actual = test.pca_response)
+   
+   # print fraction of correct predictions
+   accuracies[i] <- sum(diag(confusion)) / sum(confusion)
+}
+
+accuracies
+(best_k <- (which.max(accuracies)))
+accuracies[best_k]
+```
+
+Here we can see that KNN benefits greatly from dimension reduction using PCA, as the best KNN model here has about 13% higher accuracy than the original best KNN model, putting it back on par with the other models. This follows suit with my prediction above, as random points in high dimensional space tend to be similar distances from each other, therefore negatively impacting predictions. However, reducing the number of dimensions can help the KNN algorithm perform much better.
+
+
+### SVM Model using PCA
+
+```{r pca svm}
+set.seed(22)
+# create svm with different costs - also testing different kernels and leaving best
+tune.out = tune(svm, NSP ~ ., data = train.pca, kernel = "radial", 
+                ranges = list(cost = c(.1,1,5,10,25,35,50,75,100)))
+summary(tune.out)
+
+fit.svm.pca = svm(NSP ~ ., data = train.pca, kernel = "radial", cost = 25, scale = TRUE)
+summary(fit.svm.pca)
+
+preds <- predict(fit.svm.pca, newdata = test.pca)
+# print confusion matrix
+(confusion_matrix <- table(Predicted = preds, Actual = test.pca$NSP))
+# Calculate accuracy
+(accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix))
+```
+
+Here we can see that using PCA on SVM actually reduces it's effectiveness by making it about 2% less accurate for this dataset. In this case, it is possible that PCA oversimplified the data, making it harder for the SVM to find a good decision boundary.
+
+## Conclusion
+
+Overall, we can see that the random forest model worked the best out of any of the models, with an accuracy of about 95.5% when classifying NSP. This did not particularly surprise me as random forests are typically quite accurate and rather flexible when it comes to handling complex non-linear situations with higher dimensionality. We were also able to see how dimension reductionality techniques like PCA are able to improve different models such as the multinomial regression models and (especially) the KNN model. Overall, I am quite happy with my results as I was hoping for at least 90% accuracy and was able to achieve over 95% with my top-performing model. However, I think I could potentially improve my results in the future by spending a little bit more time to better understand the dataset and the meaning of the individual predictors. I think having a greater understanding of the topic itself would help me enhance my analysis and models by providing me with greater context that I can use to form hypotheses prior to building models.
